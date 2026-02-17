@@ -130,12 +130,16 @@ func (s *Server) handleGetPipeline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	run.mu.Lock()
+	resp := map[string]interface{}{
 		"id":     run.ID,
 		"status": run.Status,
 		"result": run.Result,
-	})
+	}
+	run.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleGetEvents(w http.ResponseWriter, r *http.Request) {
@@ -196,9 +200,13 @@ func (s *Server) handleGetContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	run.mu.Lock()
+	result := run.Result
+	run.mu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
-	if run.Result != nil {
-		json.NewEncoder(w).Encode(run.Result.NodeOutcomes)
+	if result != nil {
+		json.NewEncoder(w).Encode(result.NodeOutcomes)
 	} else {
 		json.NewEncoder(w).Encode(map[string]interface{}{})
 	}
@@ -226,8 +234,12 @@ func (s *Server) handleGetQuestions(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "pipeline not found", http.StatusNotFound)
 		return
 	}
+	run.mu.Lock()
+	questions := run.Questions
+	run.mu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(run.Questions)
+	json.NewEncoder(w).Encode(questions)
 }
 
 func (s *Server) handleAnswerQuestion(w http.ResponseWriter, r *http.Request) {
