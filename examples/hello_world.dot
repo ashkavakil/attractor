@@ -1,0 +1,17 @@
+digraph hello_world {
+    goal = "Create a hello world program"
+    default_max_retry = 1
+
+    start      [shape=Mdiamond, label="Start"]
+    plan       [shape=box, label="Plan", prompt="Plan how to create: $goal"]
+    implement  [shape=box, label="Implement", prompt="Write the code", goal_gate=true]
+    review     [shape=box, label="Review", prompt="Review the implementation"]
+    done       [shape=Msquare, label="Done"]
+
+    start -> plan
+    plan -> implement
+    implement -> review [condition="outcome = success"]
+    implement -> plan [condition="outcome = fail", label="Retry"]
+    review -> done [condition="outcome = success"]
+    review -> implement [condition="outcome = fail", label="Fix"]
+}
