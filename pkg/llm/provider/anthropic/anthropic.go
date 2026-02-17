@@ -43,6 +43,11 @@ func WithBaseURL(url string) Option {
 	return func(a *Adapter) { a.baseURL = url }
 }
 
+// WithHeaders sets custom headers.
+func WithHeaders(h map[string]string) Option {
+	return func(a *Adapter) { a.headers = h }
+}
+
 // NewAdapter creates a new Anthropic adapter.
 func NewAdapter(opts ...Option) *Adapter {
 	a := &Adapter{
@@ -331,6 +336,7 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 
 		var stopReason string
 		var finalUsage *llm.Usage
+		var currentBlockType string
 
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer for large tool call deltas
@@ -361,13 +367,16 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 					}
 				}
 			case "content_block_start":
-				if event.ContentBlock != nil && event.ContentBlock.Type == "tool_use" {
-					ch <- llm.StreamEvent{
-						Type: llm.StreamEventToolCallStart,
-						ToolCall: &llm.ToolCall{
-							ID:   event.ContentBlock.ID,
-							Name: event.ContentBlock.Name,
-						},
+				if event.ContentBlock != nil {
+					currentBlockType = event.ContentBlock.Type
+					if event.ContentBlock.Type == "tool_use" {
+						ch <- llm.StreamEvent{
+							Type: llm.StreamEventToolCallStart,
+							ToolCall: &llm.ToolCall{
+								ID:   event.ContentBlock.ID,
+								Name: event.ContentBlock.Name,
+							},
+						}
 					}
 				}
 			case "content_block_delta":
@@ -391,7 +400,10 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 					}
 				}
 			case "content_block_stop":
-				ch <- llm.StreamEvent{Type: llm.StreamEventToolCallEnd}
+				if currentBlockType == "tool_use" {
+					ch <- llm.StreamEvent{Type: llm.StreamEventToolCallEnd}
+				}
+				currentBlockType = ""
 			case "message_delta":
 				// Extract stop_reason and output token usage from message_delta
 				if event.Delta != nil {
@@ -424,6 +436,9 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 				}
 				ch <- endEvent
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			ch <- llm.StreamEvent{Type: llm.StreamEventError, Error: err}
 		}
 	}()
 

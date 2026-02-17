@@ -117,6 +117,13 @@ func FromEnv() *Client {
 	return c
 }
 
+// HasProviders returns true if at least one provider is registered.
+func (c *Client) HasProviders() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.providers) > 0
+}
+
 // RegisterProvider adds a provider adapter to the client.
 func (c *Client) RegisterProvider(name string, adapter ProviderAdapter) {
 	c.mu.Lock()

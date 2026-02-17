@@ -408,6 +408,9 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 				ch <- endEvent
 			}
 		}
+		if err := scanner.Err(); err != nil {
+			ch <- llm.StreamEvent{Type: llm.StreamEventError, Error: err}
+		}
 	}()
 
 	return ch, nil

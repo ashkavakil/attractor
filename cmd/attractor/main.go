@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -110,6 +111,7 @@ func cmdAgent(args []string) {
 
 	client := llm.FromEnv()
 	defer client.Close()
+	requireProvider(client)
 
 	// Resolve provider and model
 	prov := *provider
@@ -171,9 +173,17 @@ func cmdAgent(args []string) {
 		prompt = fs.Arg(0)
 	} else {
 		fmt.Fprint(os.Stderr, "Enter your prompt: ")
-		buf := make([]byte, 64*1024)
-		n, _ := os.Stdin.Read(buf)
-		prompt = string(buf[:n])
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
+			os.Exit(1)
+		}
+		prompt = string(data)
+	}
+
+	if prompt == "" {
+		fmt.Fprintln(os.Stderr, "Error: no prompt provided")
+		os.Exit(1)
 	}
 
 	if err := session.Submit(ctx, prompt); err != nil {
@@ -247,6 +257,14 @@ func cmdValidate(args []string) {
 	}
 	if len(diagnostics) == 0 {
 		fmt.Println("Valid.")
+	}
+}
+
+func requireProvider(client *llm.Client) {
+	if !client.HasProviders() {
+		fmt.Fprintln(os.Stderr, "Error: no LLM provider configured.")
+		fmt.Fprintln(os.Stderr, "Set one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or GOOGLE_API_KEY")
+		os.Exit(1)
 	}
 }
 

@@ -167,6 +167,9 @@ func (a *Adapter) buildRequest(req *llm.Request) chatRequest {
 		})
 	}
 	for _, m := range req.Messages {
+		if m.Role == llm.RoleSystem {
+			continue // handled via SystemPrompt above
+		}
 		cm := chatMessage{
 			Role:       string(m.Role),
 			ToolCallID: m.ToolCallID,
@@ -432,6 +435,9 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 					finishReason = llm.FinishReasonStop
 				}
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			ch <- llm.StreamEvent{Type: llm.StreamEventError, Error: err}
 		}
 	}()
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -118,8 +119,7 @@ type SSEHandler func(reqBody []byte) []string
 // NewSSEServer creates a test server for SSE streaming.
 func NewSSEServer(handler SSEHandler) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body := make([]byte, r.ContentLength)
-		r.Body.Read(body)
+		body, _ := io.ReadAll(r.Body)
 		r.Body.Close()
 
 		lines := handler(body)
