@@ -30,3 +30,6 @@ Thumbs.db
 
 # Spec documents (reference only)
 attractor-main/
+
+# Test artifacts
+test/work/
