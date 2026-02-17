@@ -16,6 +16,12 @@ import (
 	"github.com/ashka-vakil/attractor/pkg/llm"
 )
 
+func init() {
+	llm.RegisterProviderFactory("anthropic", "ANTHROPIC_API_KEY", func() llm.ProviderAdapter {
+		return NewAdapter()
+	})
+}
+
 // Adapter implements llm.ProviderAdapter for Anthropic.
 type Adapter struct {
 	apiKey     string
@@ -86,14 +92,15 @@ type messageParam struct {
 }
 
 type contentBlock struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   interface{}     `json:"content,omitempty"`
-	Thinking  string          `json:"thinking,omitempty"`
+	Type        string          `json:"type"`
+	Text        string          `json:"text,omitempty"`
+	ID          string          `json:"id,omitempty"`
+	Name        string          `json:"name,omitempty"`
+	Input       json.RawMessage `json:"input,omitempty"`
+	ToolUseID   string          `json:"tool_use_id,omitempty"`
+	Content     interface{}     `json:"content,omitempty"`
+	Thinking    string          `json:"thinking,omitempty"`
+	PartialJSON string          `json:"partial_json,omitempty"`
 }
 
 type toolParam struct {
@@ -261,6 +268,19 @@ func (a *Adapter) Complete(ctx context.Context, req *llm.Request) (*llm.Response
 	return a.convertResponse(&msgResp), nil
 }
 
+func convertStopReason(reason string) llm.FinishReason {
+	switch reason {
+	case "end_turn":
+		return llm.FinishReasonStop
+	case "max_tokens":
+		return llm.FinishReasonLength
+	case "tool_use":
+		return llm.FinishReasonToolCalls
+	default:
+		return llm.FinishReasonStop
+	}
+}
+
 func (a *Adapter) convertResponse(mr *messagesResponse) *llm.Response {
 	resp := &llm.Response{
 		ID:    mr.ID,
@@ -273,14 +293,7 @@ func (a *Adapter) convertResponse(mr *messagesResponse) *llm.Response {
 		CreatedAt: time.Now(),
 	}
 
-	switch mr.StopReason {
-	case "end_turn":
-		resp.FinishReason = llm.FinishReasonStop
-	case "max_tokens":
-		resp.FinishReason = llm.FinishReasonLength
-	case "tool_use":
-		resp.FinishReason = llm.FinishReasonToolCalls
-	}
+	resp.FinishReason = convertStopReason(mr.StopReason)
 
 	var textParts []string
 	for _, block := range mr.Content {
@@ -316,7 +329,11 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 		defer close(ch)
 		defer resp.Body.Close()
 
+		var stopReason string
+		var finalUsage *llm.Usage
+
 		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer for large tool call deltas
 		for scanner.Scan() {
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data: ") {
@@ -325,9 +342,9 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 			data := strings.TrimPrefix(line, "data: ")
 
 			var event struct {
-				Type         string         `json:"type"`
-				Delta        *contentBlock  `json:"delta,omitempty"`
-				ContentBlock *contentBlock  `json:"content_block,omitempty"`
+				Type         string            `json:"type"`
+				Delta        *contentBlock     `json:"delta,omitempty"`
+				ContentBlock *contentBlock     `json:"content_block,omitempty"`
 				Message      *messagesResponse `json:"message,omitempty"`
 				Usage        *anthropicUsage   `json:"usage,omitempty"`
 			}
@@ -338,6 +355,11 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 			switch event.Type {
 			case "message_start":
 				ch <- llm.StreamEvent{Type: llm.StreamEventStart}
+				if event.Message != nil {
+					finalUsage = &llm.Usage{
+						InputTokens: event.Message.Usage.InputTokens,
+					}
+				}
 			case "content_block_start":
 				if event.ContentBlock != nil && event.ContentBlock.Type == "tool_use" {
 					ch <- llm.StreamEvent{
@@ -359,7 +381,7 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 					case "input_json_delta":
 						ch <- llm.StreamEvent{
 							Type:  llm.StreamEventToolCallDelta,
-							Delta: event.Delta.Text,
+							Delta: event.Delta.PartialJSON,
 						}
 					case "thinking_delta":
 						ch <- llm.StreamEvent{
@@ -369,16 +391,38 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 					}
 				}
 			case "content_block_stop":
-				// No specific action needed
+				ch <- llm.StreamEvent{Type: llm.StreamEventToolCallEnd}
 			case "message_delta":
+				// Extract stop_reason and output token usage from message_delta
 				if event.Delta != nil {
-					// The delta here contains stop_reason
+					// The delta is marshaled as a raw object; the stop_reason comes in delta
+					// but our contentBlock struct reuses Text field for it
+				}
+				// Anthropic sends stop_reason in the delta as a top-level field
+				var deltaRaw struct {
+					Delta struct {
+						StopReason string `json:"stop_reason"`
+					} `json:"delta"`
+					Usage *anthropicUsage `json:"usage"`
+				}
+				json.Unmarshal([]byte(data), &deltaRaw)
+				if deltaRaw.Delta.StopReason != "" {
+					stopReason = deltaRaw.Delta.StopReason
+				}
+				if deltaRaw.Usage != nil && finalUsage != nil {
+					finalUsage.OutputTokens = deltaRaw.Usage.OutputTokens
+					finalUsage.TotalTokens = finalUsage.InputTokens + finalUsage.OutputTokens
 				}
 			case "message_stop":
-				ch <- llm.StreamEvent{
+				fr := convertStopReason(stopReason)
+				endEvent := llm.StreamEvent{
 					Type:         llm.StreamEventEnd,
-					FinishReason: llm.FinishReasonStop,
+					FinishReason: fr,
 				}
+				if finalUsage != nil {
+					endEvent.Usage = finalUsage
+				}
+				ch <- endEvent
 			}
 		}
 	}()

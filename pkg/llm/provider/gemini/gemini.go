@@ -16,6 +16,12 @@ import (
 	"github.com/ashka-vakil/attractor/pkg/llm"
 )
 
+func init() {
+	llm.RegisterProviderFactory("gemini", "GEMINI_API_KEY,GOOGLE_API_KEY", func() llm.ProviderAdapter {
+		return NewAdapter()
+	})
+}
+
 // Adapter implements llm.ProviderAdapter for Google Gemini.
 type Adapter struct {
 	apiKey     string
@@ -122,6 +128,19 @@ type usageMetadata struct {
 	PromptTokenCount     int `json:"promptTokenCount"`
 	CandidatesTokenCount int `json:"candidatesTokenCount"`
 	TotalTokenCount      int `json:"totalTokenCount"`
+}
+
+func convertGeminiFinishReason(reason string) llm.FinishReason {
+	switch reason {
+	case "STOP":
+		return llm.FinishReasonStop
+	case "MAX_TOKENS":
+		return llm.FinishReasonLength
+	case "SAFETY", "RECITATION", "OTHER":
+		return llm.FinishReasonStop
+	default:
+		return llm.FinishReasonStop
+	}
 }
 
 func (a *Adapter) buildRequest(req *llm.Request) generateRequest {
@@ -250,14 +269,7 @@ func (a *Adapter) convertResponse(gr *generateResponse) *llm.Response {
 	if len(gr.Candidates) > 0 {
 		cand := gr.Candidates[0]
 
-		switch cand.FinishReason {
-		case "STOP":
-			resp.FinishReason = llm.FinishReasonStop
-		case "MAX_TOKENS":
-			resp.FinishReason = llm.FinishReasonLength
-		default:
-			resp.FinishReason = llm.FinishReasonStop
-		}
+		resp.FinishReason = convertGeminiFinishReason(cand.FinishReason)
 
 		var textParts []string
 		for _, p := range cand.Content.Parts {
@@ -320,6 +332,7 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 		defer resp.Body.Close()
 
 		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer
 		for scanner.Scan() {
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data: ") {
@@ -333,6 +346,18 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 			}
 
 			if len(chunk.Candidates) == 0 {
+				// May contain usage metadata without candidates
+				if chunk.UsageMetadata.TotalTokenCount > 0 {
+					ch <- llm.StreamEvent{
+						Type: llm.StreamEventEnd,
+						Usage: &llm.Usage{
+							InputTokens:  chunk.UsageMetadata.PromptTokenCount,
+							OutputTokens: chunk.UsageMetadata.CandidatesTokenCount,
+							TotalTokens:  chunk.UsageMetadata.TotalTokenCount,
+						},
+						FinishReason: llm.FinishReasonStop,
+					}
+				}
 				continue
 			}
 
@@ -349,6 +374,7 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 					ch <- llm.StreamEvent{
 						Type: llm.StreamEventToolCallStart,
 						ToolCall: &llm.ToolCall{
+							ID:        fmt.Sprintf("call_%s_%d", p.FunctionCall.Name, time.Now().UnixNano()),
 							Name:      p.FunctionCall.Name,
 							Arguments: args,
 						},
@@ -357,10 +383,29 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 			}
 
 			if cand.FinishReason != "" {
-				ch <- llm.StreamEvent{
-					Type:         llm.StreamEventEnd,
-					FinishReason: llm.FinishReasonStop,
+				fr := convertGeminiFinishReason(cand.FinishReason)
+				hasToolCalls := false
+				for _, p := range cand.Content.Parts {
+					if p.FunctionCall != nil {
+						hasToolCalls = true
+						break
+					}
 				}
+				if hasToolCalls {
+					fr = llm.FinishReasonToolCalls
+				}
+				endEvent := llm.StreamEvent{
+					Type:         llm.StreamEventEnd,
+					FinishReason: fr,
+				}
+				if chunk.UsageMetadata.TotalTokenCount > 0 {
+					endEvent.Usage = &llm.Usage{
+						InputTokens:  chunk.UsageMetadata.PromptTokenCount,
+						OutputTokens: chunk.UsageMetadata.CandidatesTokenCount,
+						TotalTokens:  chunk.UsageMetadata.TotalTokenCount,
+					}
+				}
+				ch <- endEvent
 			}
 		}
 	}()

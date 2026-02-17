@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -63,17 +64,56 @@ func NewClient(opts ...ClientOption) *Client {
 	return c
 }
 
+// ProviderFactory creates a ProviderAdapter. Used by FromEnv to lazily instantiate
+// providers without creating an import cycle.
+type ProviderFactory func() ProviderAdapter
+
+var (
+	registryMu        sync.Mutex
+	providerFactories []providerRegistration
+)
+
+type providerRegistration struct {
+	name    string
+	envKeys []string // any of these env vars being set triggers registration
+	factory ProviderFactory
+}
+
+// RegisterProviderFactory registers a factory for FromEnv discovery.
+// Provider packages call this in their init() functions.
+// envKeys is a comma-separated list of environment variable names; if any is set,
+// the factory will be invoked.
+func RegisterProviderFactory(name, envKeys string, factory ProviderFactory) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	providerFactories = append(providerFactories, providerRegistration{
+		name:    name,
+		envKeys: strings.Split(envKeys, ","),
+		factory: factory,
+	})
+}
+
 // FromEnv creates a Client from environment variables.
 // Registers providers whose API keys are present.
 func FromEnv() *Client {
 	c := &Client{
 		providers: make(map[string]ProviderAdapter),
 	}
-	// Provider registration is handled by the provider packages.
-	// This is a placeholder; actual providers register themselves.
-	_ = os.Getenv("OPENAI_API_KEY")
-	_ = os.Getenv("ANTHROPIC_API_KEY")
-	_ = os.Getenv("GEMINI_API_KEY")
+
+	registryMu.Lock()
+	registrations := make([]providerRegistration, len(providerFactories))
+	copy(registrations, providerFactories)
+	registryMu.Unlock()
+
+	for _, reg := range registrations {
+		for _, key := range reg.envKeys {
+			if os.Getenv(strings.TrimSpace(key)) != "" {
+				c.RegisterProvider(reg.name, reg.factory())
+				break
+			}
+		}
+	}
+
 	return c
 }
 

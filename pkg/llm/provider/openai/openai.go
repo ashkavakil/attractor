@@ -16,6 +16,12 @@ import (
 	"github.com/ashka-vakil/attractor/pkg/llm"
 )
 
+func init() {
+	llm.RegisterProviderFactory("openai", "OPENAI_API_KEY", func() llm.ProviderAdapter {
+		return NewAdapter()
+	})
+}
+
 // Adapter implements llm.ProviderAdapter for OpenAI.
 type Adapter struct {
 	apiKey     string
@@ -87,8 +93,13 @@ type chatRequest struct {
 	TopP             *float64          `json:"top_p,omitempty"`
 	Stop             []string          `json:"stop,omitempty"`
 	Stream           bool              `json:"stream,omitempty"`
+	StreamOptions    *streamOptions    `json:"stream_options,omitempty"`
 	ResponseFormat   *responseFormat   `json:"response_format,omitempty"`
 	ReasoningEffort  string            `json:"reasoning_effort,omitempty"`
+}
+
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type chatMessage struct {
@@ -327,6 +338,7 @@ func (a *Adapter) convertResponse(cr *chatResponse) *llm.Response {
 func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.StreamEvent, error) {
 	cr := a.buildRequest(req)
 	cr.Stream = true
+	cr.StreamOptions = &streamOptions{IncludeUsage: true}
 
 	resp, err := a.doRequest(ctx, cr, true)
 	if err != nil {
@@ -338,7 +350,11 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 		defer close(ch)
 		defer resp.Body.Close()
 
+		var finalUsage *llm.Usage
+		var finishReason llm.FinishReason
+
 		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB buffer
 		for scanner.Scan() {
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data: ") {
@@ -346,6 +362,14 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 			}
 			data := strings.TrimPrefix(line, "data: ")
 			if data == "[DONE]" {
+				endEvent := llm.StreamEvent{
+					Type:         llm.StreamEventEnd,
+					FinishReason: finishReason,
+				}
+				if finalUsage != nil {
+					endEvent.Usage = finalUsage
+				}
+				ch <- endEvent
 				break
 			}
 
@@ -353,6 +377,15 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 				ch <- llm.StreamEvent{Type: llm.StreamEventError, Error: err}
 				return
+			}
+
+			// Capture usage from the final chunk (sent when stream_options.include_usage is true)
+			if chunk.Usage.TotalTokens > 0 {
+				finalUsage = &llm.Usage{
+					InputTokens:  chunk.Usage.PromptTokens,
+					OutputTokens: chunk.Usage.CompletionTokens,
+					TotalTokens:  chunk.Usage.TotalTokens,
+				}
 			}
 
 			if len(chunk.Choices) == 0 {
@@ -388,16 +421,15 @@ func (a *Adapter) Stream(ctx context.Context, req *llm.Request) (<-chan llm.Stre
 			}
 
 			if choice.FinishReason != "" {
-				fr := llm.FinishReasonStop
 				switch choice.FinishReason {
+				case "stop":
+					finishReason = llm.FinishReasonStop
 				case "length":
-					fr = llm.FinishReasonLength
+					finishReason = llm.FinishReasonLength
 				case "tool_calls":
-					fr = llm.FinishReasonToolCalls
-				}
-				ch <- llm.StreamEvent{
-					Type:         llm.StreamEventEnd,
-					FinishReason: fr,
+					finishReason = llm.FinishReasonToolCalls
+				default:
+					finishReason = llm.FinishReasonStop
 				}
 			}
 		}
